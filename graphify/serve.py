@@ -6,6 +6,7 @@ import re
 import sys
 from array import array
 from pathlib import Path
+from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap
@@ -107,8 +108,66 @@ def _is_searchable(term: str) -> bool:
     return True
 
 
+# Question/filler words dropped from query terms so content words drive BFS
+# seeding. Without this, "how does the frontier cache work" seeds on "how"/
+# "the"/"work" (which prefix-match prose labels like "Working Principles" at 100x)
+# instead of "frontier"/"cache", and lands in the wrong part of the graph. Applied
+# to query terms only — node text is never filtered, so a symbol literally named
+# `work` stays findable via explain/path. `work`/`works`/`working` are included
+# because "how does X work" / "how X works" is the most common question phrasing.
+#
+# Non-English question words are just as damaging (#1900): in a mostly-English
+# code corpus, German "wie"/"funktioniert" are rare, so they get HIGH IDF weight
+# and out-seed the actual content noun by orders of magnitude. So this also
+# carries a curated German set plus a trimmed French/Spanish/Portuguese/Italian
+# set of question/filler words. Diacritics are kept intact (the query tokenizer
+# does not NFKD-strip).
+#
+# Collision tradeoff: a few foreign stopwords are also English content words.
+# We include high-German-value ones like "die"/"hat" (the all-stopword fallback
+# in _query_terms and the unfiltered find_node path keep an English "die"/"hat"
+# query workable), but deliberately OMIT "war"/"bald" (German was/soon) so
+# English queries about "war" or "bald" are not clobbered. On the Romance side
+# we likewise omit "comment" (FR how), "come" (IT how), "son"/"sin"/"con" (ES),
+# and "pour"/"des" (FR) — all too common as English/code terms.
+_QUERY_STOPWORDS = frozenset({
+    # English
+    "how", "what", "why", "when", "where", "which", "who", "whom", "whose",
+    "does", "did", "is", "are", "was", "were", "be", "been", "being",
+    "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+    "has", "have", "had", "the", "and", "but", "not", "for", "from", "with",
+    "without", "into", "onto", "off", "that", "this", "these", "those", "there",
+    "here", "its", "their", "them", "they", "about", "any", "all", "some",
+    "work", "works", "working",
+    # German (articles/conjunctions/question words/auxiliaries/prepositions)
+    "der", "die", "das", "den", "dem", "ein", "eine", "und", "oder", "nicht",
+    "wie", "wer", "wann", "wo", "warum", "wieso",
+    "welche", "welcher", "welches",
+    "ist", "sind", "wird", "wurde", "hat", "haben",
+    "kann", "koennen", "können", "soll", "muss", "sich",
+    "bei", "mit", "von", "fuer", "für", "ueber", "über", "nach", "aus",
+    "gibt", "es",
+    "funktioniert", "geaendert", "geändert", "aendert", "ändert",
+    # French
+    "pourquoi", "quand", "quel", "quelle", "quels", "quelles", "quoi",
+    "qui", "que", "est", "sont", "fonctionne", "cette", "dans", "avec", "où",
+    # Spanish
+    "cómo", "como", "qué", "cuál", "cuáles", "cuándo", "dónde", "donde",
+    "porque", "por", "para", "funciona", "está", "están", "hay",
+    # Portuguese
+    "qual", "quais", "quando", "onde", "são", "estão", "tem", "uma", "não",
+    # Italian
+    "perché", "cosa", "quale", "quali", "dove", "funziona", "sono", "che",
+    "della",
+})
+
+
 def _query_terms(question: str) -> list[str]:
-    """Split a query into searchable terms, segmenting Chinese text."""
+    """Split a query into searchable terms, segmenting Chinese text, then drop
+    question/filler words (`_QUERY_STOPWORDS`, English plus common German/
+    Romance-language fillers) so content words drive seeding. Falls back to the
+    unfiltered terms if the query is all stopwords, so a question like "how does
+    it work" or "wie funktioniert das" still seeds on something."""
     terms: list[str] = []
     for raw in question.split():
         if _has_chinese(raw):
@@ -121,7 +180,8 @@ def _query_terms(question: str) -> list[str]:
             for tok in re.findall(r"\w+", raw.lower()):
                 if _is_searchable(tok):
                     terms.append(tok)
-    return terms
+    content = [t for t in terms if t not in _QUERY_STOPWORDS]
+    return content or terms
 
 
 _EXACT_MATCH_BONUS = 1000.0
@@ -136,7 +196,7 @@ def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
     Common terms like 'error' or 'exception' that match hundreds of nodes get
     low weights; rare identifiers like 'FooBarService' get high weights.
     Cache is stored on the graph object itself so it auto-invalidates when
-    _maybe_reload() replaces G with a new object.
+    a hot-reload replaces G with a new object.
     """
     cache: dict[str, float] = G.graph.setdefault("_idf_cache", {})
     N = G.number_of_nodes() or 1
@@ -188,7 +248,7 @@ def _node_search_text(data: dict, nid: str) -> str:
 def _get_trigram_index(G: nx.Graph) -> dict:
     """Lazily build and cache a trigram -> node-position postings map on the graph.
 
-    Cached on `G.graph` so it auto-invalidates when _maybe_reload() swaps in a
+    Cached on `G.graph` so it auto-invalidates when a hot-reload swaps in a
     fresh graph object, exactly like `_idf_cache`. `set_cache` memoizes per-trigram
     id-sets across queries within one graph generation.
     """
@@ -261,9 +321,68 @@ def _trigram_candidates(G: nx.Graph, needles: list[str], *, guard_frac: float = 
     return [ids[i] for i in sorted(cand)]
 
 
+class _QueryScores(NamedTuple):
+    """Per-query scoring result, returned by the private `_score_query` helper.
+
+    `ranked` is the existing ordered `(score, node_id)` ranking produced by the
+    combined query scorer (the value `_score_nodes` always returned). When the
+    caller asks for it via `collect_per_term_seeds=True`, `best_seed_by_term`
+    additionally carries the winning node id for each normalized search token —
+    the seed `_pick_seeds` would have picked for that token via the now-retired
+    per-token `_score_nodes([token])` rescoring pass — computed in the *same*
+    per-node traversal so the query path makes exactly one graph scoring pass
+    regardless of query length. Empty when `collect_per_term_seeds=False`.
+    """
+    ranked: list[tuple[float, str]]
+    best_seed_by_term: dict[str, str]
+
+
 def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
-    scored = []
-    norm_terms = [tok for t in terms for tok in _search_tokens(t)]
+    """Combined query scorer returning the existing ranked `(score, node_id)` list.
+
+    Backwards-compatible thin wrapper around `_score_query` for path, explain,
+    tests, and every other caller that only needs the combined ranking. The
+    per-term seed metadata computed by `_score_query` (when requested) is
+    discarded here so existing callers see no API or runtime-cost change.
+    """
+    return _score_query(G, terms, collect_per_term_seeds=False).ranked
+
+
+def _score_query(
+    G: nx.Graph, terms: list[str], *, collect_per_term_seeds: bool
+) -> _QueryScores:
+    """Single-pass combined scorer that optionally also records the best seed
+    for each normalized query token.
+
+    The combined ranking is byte-identical to what `_score_nodes` produced
+    before the refactor; `_score_nodes` is now a thin wrapper that asks for
+    `collect_per_term_seeds=False` and returns only `.ranked`.
+
+    When `collect_per_term_seeds=True`, the per-token singleton winner is
+    computed alongside the combined score in the *same* per-node visit (it
+    reuses the same `norm_label` / `label_tokens` / `source` already evaluated
+    for the combined tier), so `_query_graph_text` can feed `best_seed_by_term`
+    straight into `_pick_seeds` and skip the T additional whole-graph rescoring
+    passes the old per-token `_score_nodes([token])` loop ran.
+
+    Singleton-winner semantics match the legacy per-token path exactly. The
+    score itself mirrors `_score_nodes([token])` with `n_terms == 1` (so the
+    coverage term is 1 and the per-token tier is unscaled) plus the broader
+    joined-singlet tier (which also checks `label_tokens` and `nid_lower`).
+    Tie-break order is (1) highest singleton score, (2) highest graph degree,
+    (3) shortest displayed label, (4) lexicographically smallest node id —
+    exactly what `max(tied, key=degree)` over a sort by `(-score, label_len,
+    nid)` produced in the legacy `_pick_seeds` per-token loop. The combined
+    trigram candidate set (needles `norm_terms + [joined]`) is a superset of
+    each per-token `[t]` candidate set, so iterating combined candidates
+    discovers every non-zero singleton-score node for every term.
+    """
+    scored: list[tuple[float, str]] = []
+    # Dedupe tokens, order-preserving (as _pick_seeds already does): a repeated
+    # query word must not double-count every tier, and with coverage scaling
+    # below it would also inflate the matched-term ratio (#1602).
+    norm_terms = list(dict.fromkeys(tok for t in terms for tok in _search_tokens(t)))
+    n_terms = len(norm_terms)
     idf = _compute_idf(G, norm_terms)
     # Whole-query string for full-label matching (mirrors _find_node's `term`).
     joined = " ".join(norm_terms)
@@ -279,6 +398,16 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
         G.nodes(data=True) if candidate_ids is None
         else ((nid, G.nodes[nid]) for nid in candidate_ids)
     )
+    # Per-token best tracking, only when the caller (the query path) wants the
+    # seed metadata. The key tuple is the full multi-key tie-break
+    # (`(-singleton_score, -degree, label_len, nid)`), so `min` over the
+    # stored key mirrors the legacy `max(tied, key=degree)` over a
+    # (-score, label_len, nid)-sorted term_scored list. `None` is comparable
+    # as "smaller" than every tuple, so the first non-zero candidate seeds the
+    # entry without a separate `if t not in best_by_term` branch.
+    best_by_term: dict[str, tuple[tuple, str]] | None = (
+        {} if collect_per_term_seeds else None
+    )
     for nid, data in node_iter:
         norm_label = data.get("norm_label") or _strip_diacritics(data.get("label") or "").lower()
         bare_label = norm_label.rstrip("()")
@@ -289,6 +418,11 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
         # driver".
         label_tokens = " ".join(_search_tokens(data.get("label") or ""))
         source = (data.get("source_file") or "").lower()
+        # `nid_lower` is needed both by the full-query tier (`if joined`) and by
+        # the per-token singleton tier (joined-singlet exact-match check). When
+        # neither runs (`joined` empty AND not collecting seeds) skip the call;
+        # this preserves the single-query-time perf where nid_lower was lazy.
+        nid_lower = nid.lower() if (joined or collect_per_term_seeds) else ""
         score = 0.0
         # Full-query tier: a multi-word query that equals (or prefixes) the whole
         # label must dominate the per-token bag-of-words sums below, so `path`/
@@ -297,7 +431,6 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
         # tier never fires, and every node sharing the token set ties -> arbitrary
         # node-id sort -> wrong/disconnected endpoint -> false "No path found".
         if joined:
-            nid_lower = nid.lower()
             if joined in (norm_label, bare_label, label_tokens, nid_lower):
                 score += _EXACT_MATCH_BONUS * 10 * joined_w
             elif (
@@ -306,42 +439,198 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
                 or label_tokens.startswith(joined)
             ):
                 score += _PREFIX_MATCH_BONUS * 10 * joined_w
+        # Term coverage (#1602): scale the per-term exact/prefix tiers by the
+        # squared fraction of query terms the node's LABEL matches, so a lone
+        # generic word that happens to equal a short label (query term "home"
+        # vs. a home() leaf) cannot bury nodes that match several of the
+        # query's terms. Squaring matters because the exact tier is 10x the
+        # prefix tier: at linear coverage a 1-of-10-terms exact match still
+        # outscores a 3-of-10 prefix+substring match. Single-term and
+        # full-coverage queries are unchanged (coverage == 1), so identifier
+        # lookups keep exact-match dominance. Source-file hits score but do
+        # not count as coverage: a colliding leaf whose directory shares
+        # tokens with the query (common near the intended target) must not
+        # win back its exact tier via path fragments. The substring/source
+        # bonuses and the full-query tier above stay unscaled.
+        matched = 0
+        tiered = 0.0
         for t in norm_terms:
             w = idf.get(t, 1.0)
-            # Three-tier precedence: exact > prefix > substring (take the
-            # strongest tier per term so a single term cannot double-count).
+            # Per-tier contributions for this token, kept separate so the
+            # singleton tracking below can reuse them without re-evaluating
+            # the same predicates. Three-tier precedence: exact > prefix >
+            # substring (take the strongest tier per term so a single term
+            # cannot double-count).
+            tier_value = 0.0
+            substr_value = 0.0
+            source_value = 0.0
             if t == norm_label or t == bare_label:
-                score += _EXACT_MATCH_BONUS * w
+                tier_value = _EXACT_MATCH_BONUS * w
+                matched += 1
             elif norm_label.startswith(t) or bare_label.startswith(t):
-                score += _PREFIX_MATCH_BONUS * w
+                tier_value = _PREFIX_MATCH_BONUS * w
+                matched += 1
             elif t in norm_label:
-                score += _SUBSTRING_MATCH_BONUS * w
+                substr_value = _SUBSTRING_MATCH_BONUS * w
+                score += substr_value
+                matched += 1
             if t in source:
-                score += _SOURCE_MATCH_BONUS * w
+                source_value = _SOURCE_MATCH_BONUS * w
+                score += source_value
+            tiered += tier_value
+            if collect_per_term_seeds and best_by_term is not None:
+                # Singleton score for [t] on this node, mirroring
+                # `_score_nodes(G, [t])` exactly (n_terms == 1, no coverage
+                # scaling). The joined-singlet tier is broader than the per-
+                # token tier: it also checks `label_tokens` and `nid_lower`,
+                # matching the legacy single-token `_score_nodes([t])` call
+                # (where `joined == t`).
+                if t in (norm_label, bare_label, label_tokens, nid_lower):
+                    singleton = _EXACT_MATCH_BONUS * 10 * w
+                elif (
+                    norm_label.startswith(t)
+                    or bare_label.startswith(t)
+                    or label_tokens.startswith(t)
+                ):
+                    singleton = _PREFIX_MATCH_BONUS * 10 * w
+                else:
+                    singleton = 0.0
+                singleton += tier_value + substr_value + source_value
+                if singleton > 0:
+                    # Tie-break key mirrors the legacy sort+max(degree):
+                    # (-singleton, -degree, label_len, nid) — the minimum
+                    # tuple wins, exactly matching max(tied, key=degree)
+                    # over (label_len asc, nid asc)-sorted ties.
+                    key = (-singleton, -G.degree(nid), len(data.get("label") or nid), nid)
+                    cur = best_by_term.get(t)
+                    if cur is None or key < cur[0]:
+                        best_by_term[t] = (key, nid)
+        if tiered:
+            score += tiered * (matched / n_terms) ** 2
         if score > 0:
             scored.append((score, nid))
     # Sort by score desc; break ties toward the shorter label so a concise exact
     # match beats a longer superset that happens to share the same score.
     scored.sort(key=lambda s: (-s[0], len(G.nodes[s[1]].get("label") or s[1]), s[1]))
-    return scored
+    best_seed_by_term: dict[str, str] = {}
+    if collect_per_term_seeds and best_by_term:
+        best_seed_by_term = {t: nid for t, (_key, nid) in best_by_term.items()}
+    return _QueryScores(ranked=scored, best_seed_by_term=best_seed_by_term)
 
 
-def _pick_seeds(scored: list[tuple[float, str]], max_k: int = 3, gap_ratio: float = 0.2) -> list[str]:
+def _pick_scored_endpoint(G: nx.Graph, scored: list[tuple[float, str]], query: str) -> str:
+    """Pick a path endpoint from a _score_nodes result, preferring full-token matches.
+
+    The full-query tier in _score_nodes only fires when the query equals or
+    prefixes a label, so a query that is a token *subset* of the intended label
+    (query "Reject-everything judge" vs. label "Degenerate Reject-Everything
+    Judge") gets no bonus, and a node prefix-matching one rare token (label
+    "Rejection Summary") can out-score it on IDF alone. Committing to scored[0]
+    then anchors the path on an unrelated — often disconnected — node and yields
+    a false "No path found". Scan the score-ordered list and take the first
+    candidate whose label contains EVERY query token; when the top candidate
+    already full-matches, or no candidate does, this is exactly scored[0].
+
+    `scored` must be non-empty (both callers return early on no match).
+    """
+    qtokens = set(_search_tokens(query))
+    if not qtokens:
+        return scored[0][1]
+    for _score, nid in scored:
+        if qtokens <= set(_search_tokens(G.nodes[nid].get("label") or nid)):
+            return nid
+    return scored[0][1]
+
+
+def _pick_seeds(
+    scored: list[tuple[float, str]],
+    max_k: int = 3,
+    gap_ratio: float = 0.2,
+    *,
+    G: "nx.Graph | None" = None,
+    best_seed_by_term: dict[str, str] | None = None,
+) -> list[str]:
     """Select BFS seed nodes, stopping when score drops too far below the top.
 
     Prevents high-frequency noise terms (error, exception) from stealing seed
     slots from a dominant identifier match. When FooBarService scores 1000 and
     error nodes score 1.0, only FooBarService is seeded — the score gap is 99.9%
     which is well above the 20% threshold that would allow additional seeds.
+
+    That same gap_ratio cutoff has a failure mode on multi-term natural-language
+    queries: if one term happens to hit an EXACT label match on a node that is
+    otherwise unrelated to the query's intent (e.g. a common word that is also
+    used as an unrelated identifier or field name elsewhere in the corpus), it
+    can outscore every SUBSTRING match on the query's other, actually-relevant
+    terms by ~1000x (see `_EXACT_MATCH_BONUS` vs. `_SUBSTRING_MATCH_BONUS`).
+    The 20%-gap cutoff then silently discards all of those substring-tier
+    seeds, so the BFS traversal only ever explores the neighborhood of the one
+    unrelated exact match — see #1445.
+
+    When `G` and `best_seed_by_term` are supplied, this guarantees at least one
+    seed per distinct query term that has any match at all, so one term's
+    incidental collision cannot starve out the others. The per-token winners
+    in `best_seed_by_term` are precomputed by `_score_query` (during the same
+    traversal that produced `scored`) so this function no longer rescores the
+    graph per term — see #1445 and the `_score_query` docstring.
+
+    Coverage scaling in _score_nodes (#1602) now dampens a lone collision's
+    exact tier on multi-term queries, which brings label-matching relevant
+    nodes back inside the gap window; this per-term guarantee remains
+    load-bearing for relevant nodes matched only via substrings, whose flat
+    scores a dampened collision can still exceed.
     """
     if not scored:
         return []
+
+    # Deduplicate seeds by (normalized) label so a generic, homonymous symbol —
+    # e.g. dozens of route handlers all labelled `GET`/`POST`, or a `handler`
+    # repeated across a framework — contributes at most one seed instead of
+    # consuming every slot and flooding the BFS with near-identical neighborhoods
+    # (#1766). The key mirrors _score_nodes' normalization so `GET`/`Get`/`get`
+    # collapse together. When G is absent we can't read labels, so fall back to
+    # the (unique) node id, which is a no-op — preserving the old behavior.
+    def _seed_label_key(nid: str) -> str:
+        if G is None:
+            return nid
+        data = G.nodes[nid]
+        return (data.get("norm_label")
+                or _strip_diacritics(data.get("label") or "").lower()) or nid
+
     top_score = scored[0][0]
-    seeds = []
-    for score, nid in scored[:max_k]:
+    seeds: list[str] = []
+    seen_labels: set[str] = set()
+    for score, nid in scored:
+        if len(seeds) >= max_k:
+            break
         if seeds and score < top_score * gap_ratio:
             break
+        key = _seed_label_key(nid)
+        if key in seen_labels:
+            continue
+        seen_labels.add(key)
         seeds.append(nid)
+
+    if G is not None and best_seed_by_term:
+        # Guarantee one seed per distinct query term that has any match at all,
+        # so an incidental exact match on one term cannot starve matches on
+        # other terms (#1445). Iterate tokens in a deterministic sorted order
+        # so seeds added by this loop have a stable order independent of dict
+        # iteration — preserving the legacy `_pick_seeds(terms=...)` behavior
+        # which iterated `sorted({tok ...})`. Per-token winners arrive
+        # precomputed in `best_seed_by_term` from `_score_query`'s single
+        # traversal, so `_pick_seeds` no longer rescoring the graph per term.
+        # The per-label dedup cap also gates these additions, so the guarantee
+        # cannot reintroduce a second copy of an already-seeded generic label
+        # (#1766).
+        for term in sorted(best_seed_by_term):
+            best_nid = best_seed_by_term[term]
+            # Honor the same per-label cap so the per-term guarantee can't
+            # reintroduce a second copy of an already-seeded generic label.
+            key = _seed_label_key(best_nid)
+            if best_nid not in seeds and key not in seen_labels:
+                seen_labels.add(key)
+                seeds.append(best_nid)
     return seeds
 
 
@@ -579,8 +868,14 @@ def _query_graph_text(
     context_filters: list[str] | None = None,
 ) -> str:
     terms = _query_terms(question)
-    scored = _score_nodes(G, terms)
-    start_nodes = _pick_seeds(scored)
+    # One graph scoring pass produces both the combined ranking (used to drive
+    # the gap-based seed selection below) and the per-token singleton winners
+    # (used by _pick_seeds' per-term guarantee). Previously this was T+1 passes
+    # — one combined + one per query token — re-walking the whole graph each
+    # time; on a 100k-node, three-term benchmark ~71% of scoring time was
+    # spent in those redundant per-term passes.
+    qs = _score_query(G, terms, collect_per_term_seeds=True)
+    start_nodes = _pick_seeds(qs.ranked, G=G, best_seed_by_term=qs.best_seed_by_term)
     if not start_nodes:
         return "No matching nodes found."
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
@@ -607,13 +902,20 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
     term = " ".join(_search_tokens(label))
     if not term:
         return []
+    # Punctuation-preserving normalized query. `term` tokenizes on \w+ (so
+    # "blockStream.ts" -> "blockstream ts", space where the '.' was), but a node's
+    # stored `norm_label` keeps punctuation ("blockstream.ts"). Matching only via
+    # `term`/`label_tokens` works when the node label tokenizes the same way, but is
+    # fragile if `label` and `norm_label` diverge. `norm_query` matches `norm_label`
+    # symmetrically so an exactly-typed punctuated label always resolves (#1704).
+    norm_query = _strip_diacritics(str(label)).lower().strip()
     source_exact: list[str] = []
     exact: list[str] = []
     prefix: list[str] = []
     substring: list[str] = []
     # Trigram prefilter (graph-iteration order preserved so exact/prefix/substring
     # ordering — and thus matches[0] — is byte-identical to the full scan).
-    candidate_ids = _trigram_candidates(G, [term])
+    candidate_ids = _trigram_candidates(G, [term, norm_query])
     node_iter = (
         G.nodes(data=True) if candidate_ids is None
         else ((nid, G.nodes[nid]) for nid in candidate_ids)
@@ -626,16 +928,21 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
         nid_lower = nid.lower()
         if term == source_tokens:
             source_exact.append(nid)
-        elif term == norm_label or term == bare_label or term == label_tokens or term == nid_lower:
+        elif (
+            term == norm_label or term == bare_label or term == label_tokens or term == nid_lower
+            or norm_query == norm_label or norm_query == bare_label
+        ):
             exact.append(nid)
         elif (
             norm_label.startswith(term)
             or bare_label.startswith(term)
             or label_tokens.startswith(term)
             or nid_lower.startswith(term)
+            or norm_label.startswith(norm_query)
+            or bare_label.startswith(norm_query)
         ):
             prefix.append(nid)
-        elif term in norm_label or term in label_tokens:
+        elif term in norm_label or term in label_tokens or norm_query in norm_label:
             substring.append(nid)
 
     if source_exact:
@@ -715,56 +1022,81 @@ def _build_server(graph_path: str):
     except ImportError as e:
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
 
-    G = _load_graph(graph_path)
-    communities = _communities_from_graph(G)
-    # Build the trigram query index eagerly so the first query doesn't pay the
-    # one-time build (a few seconds on a large graph). serve exists to answer
-    # queries, so absorbing the cost at startup beats spiking a random first
-    # request; it's cached on G.graph, so queries just reuse it.
-    _get_trigram_index(G)
+    from graphify import paths as _paths
 
-    # Hot-reload state: mtime+size key lets us detect graph.json changes without
-    # polling. Initialised from the file stat at startup so the first tool call
-    # never triggers a redundant reload.
-    _reload_lock = threading.Lock()
-    try:
-        _s = Path(graph_path).stat()
-        _reload_state: dict = {"mtime_ns": _s.st_mtime_ns, "size": _s.st_size}
-    except FileNotFoundError:
-        _reload_state = {"mtime_ns": 0, "size": -1}
+    # Per-graph context cache: resolved graph.json path -> {key, G, communities}.
+    # The server's default graph is just the first entry; a tool call carrying a
+    # project_path adds its own. Routing every graph through one cache means the
+    # eager trigram index and the mtime+size hot-reload behave identically for
+    # the default graph and for any project graph.
+    _default_graph_path = graph_path
+    _ctx_lock = threading.Lock()
+    _ctx_cache: dict[str, dict] = {}
 
-    def _maybe_reload() -> None:
-        nonlocal G, communities
+    def _load_ctx(path: str):
+        """Return (G, communities) for a graph.json path, reusing a cached
+        context until the file's (mtime, size) changes and then transparently
+        rebuilding it. Unlike ``_load_graph`` it never exits the process on a
+        missing/corrupt file — it raises, so a bad project_path surfaces as a
+        tool error instead of killing a server that is happily serving other
+        projects."""
         try:
-            s = Path(graph_path).stat()
+            s = Path(path).stat()
             key = (s.st_mtime_ns, s.st_size)
         except FileNotFoundError:
-            return
-        if key == (_reload_state["mtime_ns"], _reload_state["size"]):
-            return
-        with _reload_lock:
+            raise FileNotFoundError(f"graph.json not found: {path}")
+        ent = _ctx_cache.get(path)
+        if ent is not None and ent["key"] == key:
+            return ent["G"], ent["communities"]
+        with _ctx_lock:
+            ent = _ctx_cache.get(path)
+            if ent is not None and ent["key"] == key:
+                return ent["G"], ent["communities"]  # another thread built it
             try:
-                s = Path(graph_path).stat()
-                key = (s.st_mtime_ns, s.st_size)
-            except FileNotFoundError:
-                return
-            if key == (_reload_state["mtime_ns"], _reload_state["size"]):
-                return  # another thread already reloaded
-            try:
-                new_G = _load_graph(graph_path)
-            except SystemExit:
-                return  # keep serving stale graph on transient read error
-            _get_trigram_index(new_G)  # warm before exposing, so the first
-            # post-reload query is fast too (same rationale as startup)
-            G = new_G
-            communities = _communities_from_graph(new_G)
-            _reload_state["mtime_ns"], _reload_state["size"] = key
+                new_G = _load_graph(path)
+            except SystemExit as e:  # _load_graph exits on missing/corrupt file
+                raise RuntimeError(f"could not load graph.json at {path}") from e
+            # Warm the trigram index before exposing the graph so the first query
+            # against it is fast (same rationale as the original startup warm-up).
+            _get_trigram_index(new_G)
+            comm = _communities_from_graph(new_G)
+            _ctx_cache[path] = {"key": key, "G": new_G, "communities": comm}
+            return new_G, comm
+
+    def _resolve_graph_path(project_path) -> str:
+        """Map an optional project_path to a concrete graph.json path. ``None``
+        keeps the server's default graph (backward-compatible); a project_path
+        resolves to ``<project_path>/<GRAPHIFY_OUT>/graph.json``, honouring the
+        GRAPHIFY_OUT override so worktree/shared-output setups keep working."""
+        if not project_path:
+            return _default_graph_path
+        return str(Path(project_path) / _paths.GRAPHIFY_OUT / "graph.json")
+
+    # Active per-request context, rebound by _select_graph() and read by the tool
+    # handlers below. No lock needed on the hot path: _select_graph and the
+    # handler run in one synchronous stretch of each call_tool coroutine (no
+    # await between them), so a concurrent call never observes a half-applied
+    # swap.
+    active_graph_path = _default_graph_path
+    try:
+        G, communities = _load_ctx(_default_graph_path)
+    except (FileNotFoundError, RuntimeError):
+        # No default graph at startup → run as a pure multi-project server. Tools
+        # then require project_path; a call without one gets a clear error rather
+        # than the process refusing to start (which is what _load_graph would do).
+        G, communities = None, {}
+
+    def _select_graph(project_path) -> None:
+        nonlocal G, communities, active_graph_path
+        path = _resolve_graph_path(project_path)
+        G, communities = _load_ctx(path)
+        active_graph_path = path
 
     server = Server("graphify")
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
-        return [
+        _tools = [
             types.Tool(
                 name="query_graph",
                 description="Search the knowledge graph using BFS or DFS. Returns relevant nodes and edges as text context.",
@@ -885,6 +1217,20 @@ def _build_server(graph_path: str):
                 },
             ),
         ]
+        # Multi-project support: every tool accepts an optional project_path.
+        # Injected here (rather than repeated in 11 literal schemas) so the set
+        # stays in lockstep as tools are added. Omitting it keeps the historical
+        # single-graph behaviour, so this is purely additive for existing callers.
+        for _t in _tools:
+            _t.inputSchema.setdefault("properties", {})["project_path"] = {
+                "type": "string",
+                "description": (
+                    "Absolute path to a project directory containing "
+                    "graphify-out/graph.json. Optional — defaults to the graph "
+                    "this server was started with."
+                ),
+            }
+        return _tools
 
     def _tool_query_graph(arguments: dict) -> str:
         import time as _time
@@ -906,7 +1252,7 @@ def _build_server(graph_path: str):
         querylog.log_query(
             kind="mcp_query",
             question=question,
-            corpus=str(graph_path),
+            corpus=str(active_graph_path),
             result=result,
             mode=mode,
             depth=depth,
@@ -1002,7 +1348,8 @@ def _build_server(graph_path: str):
             return f"No node matching source '{arguments['source']}' found."
         if not tgt_scored:
             return f"No node matching target '{arguments['target']}' found."
-        src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
+        src_nid = _pick_scored_endpoint(G, src_scored, arguments["source"])
+        tgt_nid = _pick_scored_endpoint(G, tgt_scored, arguments["target"])
         # Ambiguity guard: when both queries resolve to the same node, the
         # shortest path is trivially zero hops, which is almost never what the
         # caller wanted (see bug #828).
@@ -1012,8 +1359,13 @@ def _build_server(graph_path: str):
                 f"the same node '{src_nid}'. Use a more specific label or the exact node ID."
             )
         warnings: list[str] = []
-        for name, scored in (("source", src_scored), ("target", tgt_scored)):
-            if len(scored) >= 2:
+        for name, scored, nid in (
+            ("source", src_scored, src_nid),
+            ("target", tgt_scored, tgt_nid),
+        ):
+            # Only meaningful when the raw score head is what got picked — a
+            # full-token override was chosen on token coverage, not score.
+            if len(scored) >= 2 and nid == scored[0][1]:
                 top, runner = scored[0][0], scored[1][0]
                 if top > 0 and (top - runner) / top < 0.10:
                     warnings.append(
@@ -1149,7 +1501,7 @@ def _build_server(graph_path: str):
     }
 
     def _load_community_labels() -> dict[int, str]:
-        labels_path = Path(graph_path).parent / ".graphify_labels.json"
+        labels_path = Path(active_graph_path).parent / ".graphify_labels.json"
         if labels_path.exists():
             try:
                 return {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
@@ -1170,10 +1522,10 @@ def _build_server(graph_path: str):
 
     @server.read_resource()
     async def read_resource(uri: AnyUrl) -> str:
-        _maybe_reload()
+        _select_graph(None)  # resources read the server's default graph
         uri_str = str(uri)
         if uri_str == "graphify://report":
-            report_path = Path(graph_path).parent / "GRAPH_REPORT.md"
+            report_path = Path(active_graph_path).parent / "GRAPH_REPORT.md"
             if report_path.exists():
                 return report_path.read_text(encoding="utf-8")
             return "GRAPH_REPORT.md not found. Run graphify extract first."
@@ -1222,11 +1574,13 @@ def _build_server(graph_path: str):
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-        _maybe_reload()
+        arguments = dict(arguments or {})
+        project_path = arguments.pop("project_path", None)
         handler = _handlers.get(name)
         if not handler:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
         try:
+            _select_graph(project_path)  # bind G/communities to the target graph
             return [types.TextContent(type="text", text=handler(arguments))]
         except Exception as exc:
             return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
